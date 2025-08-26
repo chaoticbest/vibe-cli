@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vibe-cli"
+version = "0.1.0"
+description = "CLI to deploy vibe-coded apps to vibes.chaoticbest.com"
+authors = [{name="ChaoticBest"}]
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = ["typer>=0.12", "PyYAML>=6.0", "rich>=13.7"]
+
+[project.scripts]
+vibe = "vibe.cli:app"
