@@ -12,6 +12,13 @@ STATIC_ROOT = VIBES_ROOT / "static"
 APPS_ROOT = VIBES_ROOT / "apps"
 REGISTRY_PATH = VIBES_ROOT / "registry" / "apps.json"
 
+def docker_run(image: str, workdir: Path, commands: str, env: dict):
+    cmd = ["docker","run","--rm","-v",f"{workdir}:/src","-w","/src"]
+    for k,v in env.items():
+        cmd += ["-e", f"{k}={v}"]
+    cmd += [image, "sh", "-lc", commands]
+    run(cmd) 
+
 def run(cmd, cwd: Optional[Path] = None, env: Optional[dict] = None):
     print(f"[bold cyan]$[/] {' '.join(cmd)}")
     subprocess.run(cmd, cwd=str(cwd) if cwd else None, env=env, check=True)
@@ -94,49 +101,44 @@ def deploy(repo: str, app_id: Optional[str] = typer.Option(None, help="Override 
 
     app_type = (cfg.get("type") or "static").lower()
     build_cfg = cfg.get("build", {}) if isinstance(cfg.get("build"), dict) else {}
+    use_docker = bool(build_cfg.get("use_docker"))
+    docker_image = build_cfg.get("image", "node:20-alpine")
 
-        # 3) optional build (static/spa)
-    output_dir: Path
-    if app_type in ("static", "spa"):
+    if app_type in ("static","spa"):
         install_cmd = build_cfg.get("install")
-        build_cmd = build_cfg.get("command")
+        build_cmd   = build_cfg.get("command")
         base_path_env = build_cfg.get("base_path_env")
-        if install_cmd:
-            run(install_cmd.split(), cwd=repo_dir)
 
         env = os.environ.copy()
-
-        # Base path for assets/routes
         if base_path_env:
             env[base_path_env] = f"/app/{app_id}/"
             print(f"[blue]Set {base_path_env}={env[base_path_env]}[/]")
 
-        # Build-time env from the current shell
+        # env vars from shell + env_file
         for name in (build_cfg.get("env") or []):
-            if name in os.environ:
-                env[name] = os.environ[name]
-            else:
-                print(f"[yellow]Warning:[/] build env {name} not set in process environment")
-
-        # Build-time env from a file (KEY=VALUE lines)
+            if name in os.environ: env[name] = os.environ[name]
         env_file = build_cfg.get("env_file")
-        if env_file:
-            p = Path(env_file)
-            if p.exists():
-                for line in p.read_text().splitlines():
-                    line = line.strip()
-                    if not line or line.startswith("#") or "=" not in line:
-                        continue
-                    k, v = line.split("=", 1)
-                    env[k.strip()] = v.strip()
-                print(f"[green]Loaded build env from[/] {p}")
-            else:
-                print(f"[yellow]Note:[/] env_file not found at {p}")
+        if env_file and Path(env_file).exists():
+            for line in Path(env_file).read_text().splitlines():
+                line=line.strip()
+                if not line or line.startswith("#") or "=" not in line: continue
+                k,v = line.split("=",1); env[k.strip()] = v.strip()
+            print(f"[green]Loaded build env from[/] {env_file}")
 
-        if build_cmd:
-            run(build_cmd.split(), cwd=repo_dir, env=env)
+        if use_docker:
+            cmds = []
+            if install_cmd: cmds.append(install_cmd)
+            if build_cmd:   cmds.append(build_cmd)
+            if not cmds:    cmds.append("npm ci && npm run build")
+            docker_run(docker_image, repo_dir, " && ".join(cmds), env)
+        else:
+            if install_cmd: run(install_cmd.split(), cwd=repo_dir)
+            if build_cmd:   run(build_cmd.split(),   cwd=repo_dir, env=env)
+
         out = build_cfg.get("output_dir")
         output_dir = (repo_dir / out).resolve() if out else guess_output_dir(repo_dir)
+    else:
+        print("[red]This v1 only supports type=static/spa[/]"); raise typer.Exit(2)
 
 
     if not output_dir.exists():
