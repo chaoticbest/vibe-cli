@@ -312,7 +312,7 @@ def deploy(repo: str, app_id: Optional[str] = typer.Option(None, help="Override 
         print("[red]Unknown app type[/]:", app_type)
         raise typer.Exit(code=2)
 
-    if not output_dir.exists():
+    if not output_dir:
         print(f"[red]Build output not found[/]: {output_dir}")
         raise typer.Exit(code=2)
 
