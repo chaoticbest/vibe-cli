@@ -4,6 +4,7 @@ from typing import Optional
 import typer, yaml
 from rich import print
 from rich.table import Table
+from textwrap import dedent
 
 app = typer.Typer(add_completion=False, help="Deploy vibe-coded apps to the Hub")
 
@@ -11,6 +12,115 @@ VIBES_ROOT = Path(os.environ.get("VIBES_ROOT", "/srv/vibes")).resolve()
 STATIC_ROOT = VIBES_ROOT / "static"
 APPS_ROOT = VIBES_ROOT / "apps"
 REGISTRY_PATH = VIBES_ROOT / "registry" / "apps.json"
+
+def make_traefik_labels(app_id: str, internal_port: int) -> list[str]:
+    rid = slugify(app_id).replace("-", "_")
+    host = "vibes.chaoticbest.com"
+    return [
+        "traefik.enable=true",
+        f"traefik.http.routers.{rid}.rule=Host(`{host}`) && PathPrefix(`/app/{app_id}`)",
+        "traefik.http.routers.{rid}.entrypoints=web,websecure".format(rid=rid),
+        "traefik.http.routers.{rid}.tls=true".format(rid=rid),
+        "traefik.http.routers.{rid}.tls.certresolver=le".format(rid=rid),
+        "traefik.http.routers.{rid}.priority=100".format(rid=rid),
+        f"traefik.http.middlewares.{rid}-strip.stripprefix.prefixes=/app/{app_id}",
+        f"traefik.http.routers.{rid}.middlewares={rid}-strip",
+        f"traefik.http.services.{rid}.loadbalancer.server.port={internal_port}",
+    ]
+
+def generate_dockerfile(repo_dir: Path, app_id: str, server_cfg: dict) -> Path:
+    """Create a minimal Dockerfile if repo doesn't provide one."""
+    runtime = (server_cfg.get("runtime") or "").lower()
+    install = server_cfg.get("install")
+    start = server_cfg.get("start")
+    port = int(server_cfg.get("port", 3000))
+    ddir = APPS_ROOT / slugify(app_id) / ".deploy"
+    ddir.mkdir(parents=True, exist_ok=True)
+    out = ddir / "Dockerfile.generated"
+
+    if runtime == "node":
+        content = f"""
+        FROM node:20-alpine
+        WORKDIR /app
+        COPY package*.json ./
+        {'RUN ' + install if install else 'RUN npm ci --omit=dev'}
+        COPY . .
+        ENV PORT={port}
+        EXPOSE {port}
+        CMD ["sh","-lc","{start or 'npm start'}"]
+        """
+    elif runtime == "python":
+        content = f"""
+        FROM python:3.11-slim
+        WORKDIR /app
+        COPY requirements*.txt ./
+        {'RUN ' + install if install else 'RUN pip install --no-cache-dir -r requirements.txt || true'}
+        COPY . .
+        ENV PORT={port}
+        EXPOSE {port}
+        CMD ["sh","-lc","{start or f'uvicorn app:app --host 0.0.0.0 --port {port}'}"]
+        """
+    else:
+        raise RuntimeError("runtime must be 'node' or 'python' (or provide server.dockerfile)")
+
+    out.write_text(dedent(content).strip() + "\n")
+    return out
+
+def write_compose(app_id: str, repo_dir: Path, server_cfg: dict) -> Path:
+    """Emit docker-compose.yml for this app."""
+    sid = slugify(app_id)
+    ddir = APPS_ROOT / sid / ".deploy"
+    ddir.mkdir(parents=True, exist_ok=True)
+
+    port = int(server_cfg.get("port", 3000))
+    dockerfile = server_cfg.get("dockerfile")
+    labels = make_traefik_labels(sid, port)
+    env_file = server_cfg.get("env_file")
+    env_names = server_cfg.get("env") or []
+
+    # Environment entries (from current shell) + PORT
+    env_map = {"PORT": str(port)}
+    for name in env_names:
+        if name in os.environ:
+            env_map[name] = os.environ[name]
+
+    # If Dockerfile not in repo, generate one
+    df_path: Path
+    if dockerfile:
+        df_path = (repo_dir / dockerfile).resolve()
+        if not df_path.exists():
+            raise FileNotFoundError(f"server.dockerfile not found: {df_path}")
+    else:
+        df_path = generate_dockerfile(repo_dir, sid, server_cfg)
+
+    # Compose will build from repo root with specified Dockerfile
+    compose_yaml = {
+        "version": "3.9",
+        "services": {
+            "app": {
+                "build": {
+                    "context": str(repo_dir),
+                    "dockerfile": str(df_path),
+                },
+                # optional tag makes rebuilds faster if reused
+                "image": f"vibe-{sid}:latest",
+                "restart": "unless-stopped",
+                "networks": ["vibes_net"],
+                "labels": labels,
+            }
+        },
+        "networks": {"vibes_net": {"external": True}},
+    }
+    svc = compose_yaml["services"]["app"]
+    if env_map:
+        svc["environment"] = env_map
+    if env_file:
+        svc["env_file"] = [env_file]
+
+    yml_path = ddir / "docker-compose.yml"
+    yml_path.write_text(yaml.safe_dump(compose_yaml, sort_keys=False))
+    return yml_path
+
 
 def safe_rmtree(path: Path) -> bool:
     try:
@@ -160,9 +270,17 @@ def deploy(repo: str, app_id: Optional[str] = typer.Option(None, help="Override 
 
         out = build_cfg.get("output_dir")
         output_dir = (repo_dir / out).resolve() if out else guess_output_dir(repo_dir)
+    elif app_type == "server":
+        server_cfg = cfg.get("server") or {}
+        # Compose file for this app
+        yml = write_compose(app_id, repo_dir, server_cfg)
+        print(f"[green]Compose written[/] → {yml}")
+        # Bring it up (build image + start)
+        run(["docker", "compose", "-f", str(yml), "up", "-d", "--build"])
+        output_dir = None  # not used
     else:
-        print("[red]This v1 only supports type=static/spa[/]"); raise typer.Exit(2)
-
+        print("[red]Unknown app type[/]:", app_type)
+        raise typer.Exit(code=2)
 
     if not output_dir.exists():
         print(f"[red]Build output not found[/]: {output_dir}")
