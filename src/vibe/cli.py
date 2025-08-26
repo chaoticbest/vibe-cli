@@ -13,27 +13,56 @@ STATIC_ROOT = VIBES_ROOT / "static"
 APPS_ROOT = VIBES_ROOT / "apps"
 REGISTRY_PATH = VIBES_ROOT / "registry" / "apps.json"
 
-def make_traefik_labels(app_id: str, internal_port: int) -> list[str]:
+def infer_port_from_dockerfile(path: Path) -> int | None:
+    try:
+        txt = path.read_text()
+    except Exception:
+        return None
+    m = re.search(r"^\s*EXPOSE\s+(\d+)", txt, re.MULTILINE | re.IGNORECASE)
+    return int(m.group(1)) if m else None
+
+def infer_port_from_start(start: str) -> int | None:
+    if not start:
+        return None
+    # matches: --port 8000, --port=8000, -p 3000
+    for pat in [r"--port\s+(\d+)", r"--port=(\d+)", r"-p\s+(\d+)"]:
+        m = re.search(pat, start)
+        if m:
+            return int(m.group(1))
+    return None
+
+def default_port_for_runtime(runtime: str) -> int:
+    runtime = (runtime or "").lower()
+    if runtime == "python":
+        return 8000
+    return 3000  # node or other
+
+def make_traefik_labels(app_id: str, internal_port: int | None) -> list[str]:
     rid = slugify(app_id).replace("-", "_")
     host = "vibes.chaoticbest.com"
-    return [
+    labels = [
         "traefik.enable=true",
         f"traefik.http.routers.{rid}.rule=Host(`{host}`) && PathPrefix(`/app/{app_id}`)",
-        "traefik.http.routers.{rid}.entrypoints=web,websecure".format(rid=rid),
-        "traefik.http.routers.{rid}.tls=true".format(rid=rid),
-        "traefik.http.routers.{rid}.tls.certresolver=le".format(rid=rid),
-        "traefik.http.routers.{rid}.priority=100".format(rid=rid),
+        f"traefik.http.routers.{rid}.entrypoints=web,websecure",
+        f"traefik.http.routers.{rid}.tls=true",
+        f"traefik.http.routers.{rid}.tls.certresolver=le",
+        f"traefik.http.routers.{rid}.priority=100",
         f"traefik.http.middlewares.{rid}-strip.stripprefix.prefixes=/app/{app_id}",
         f"traefik.http.routers.{rid}.middlewares={rid}-strip",
-        f"traefik.http.services.{rid}.loadbalancer.server.port={internal_port}",
     ]
+    if internal_port:
+        labels.append(f"traefik.http.services.{rid}.loadbalancer.server.port={internal_port}")
+    # If internal_port is None, Traefik will try the container's EXPOSEd port.
+    return labels
 
-def generate_dockerfile(repo_dir: Path, app_id: str, server_cfg: dict) -> Path:
-    """Create a minimal Dockerfile if repo doesn't provide one."""
+
+def generate_dockerfile(repo_dir: Path, app_id: str, server_cfg: dict) -> tuple[Path, int]:
     runtime = (server_cfg.get("runtime") or "").lower()
     install = server_cfg.get("install")
-    start = server_cfg.get("start")
-    port = int(server_cfg.get("port", 3000))
+    start   = server_cfg.get("start") or ""
+    # try to infer from start, else fallback by runtime
+    port = infer_port_from_start(start) or default_port_for_runtime(runtime)
+
     ddir = APPS_ROOT / slugify(app_id) / ".deploy"
     ddir.mkdir(parents=True, exist_ok=True)
     out = ddir / "Dockerfile.generated"
@@ -64,58 +93,59 @@ def generate_dockerfile(repo_dir: Path, app_id: str, server_cfg: dict) -> Path:
         raise RuntimeError("runtime must be 'node' or 'python' (or provide server.dockerfile)")
 
     out.write_text(dedent(content).strip() + "\n")
-    return out
+    return out, port
 
 def write_compose(app_id: str, repo_dir: Path, server_cfg: dict) -> Path:
-    """Emit docker-compose.yml for this app."""
     sid = slugify(app_id)
     ddir = APPS_ROOT / sid / ".deploy"
     ddir.mkdir(parents=True, exist_ok=True)
 
-    port = int(server_cfg.get("port", 3000))
+    # 1) Determine dockerfile and internal port
     dockerfile = server_cfg.get("dockerfile")
-    labels = make_traefik_labels(sid, port)
-    env_file = server_cfg.get("env_file")
-    env_names = server_cfg.get("env") or []
+    internal_port: int | None = None
 
-    # Environment entries (from current shell) + PORT
-    env_map = {"PORT": str(port)}
-    for name in env_names:
-        if name in os.environ:
-            env_map[name] = os.environ[name]
-
-    # If Dockerfile not in repo, generate one
-    df_path: Path
     if dockerfile:
         df_path = (repo_dir / dockerfile).resolve()
         if not df_path.exists():
             raise FileNotFoundError(f"server.dockerfile not found: {df_path}")
+        # Try to infer EXPOSEd port
+        internal_port = infer_port_from_dockerfile(df_path)
     else:
-        df_path = generate_dockerfile(repo_dir, sid, server_cfg)
+        # Generate one based on runtime/start; this returns both path and port
+        df_path, internal_port = generate_dockerfile(repo_dir, sid, server_cfg)
 
-    # Compose will build from repo root with specified Dockerfile
+    # Fallbacks if still unknown
+    if internal_port is None:
+        internal_port = infer_port_from_start(server_cfg.get("start") or "")
+    if internal_port is None:
+        internal_port = default_port_for_runtime(server_cfg.get("runtime") or "")
+
+    # 2) Build environment (PORT, plus any pass-through names)
+    env_names = server_cfg.get("env") or []
+    env_map = {"PORT": str(internal_port)}
+    for name in env_names:
+        if name in os.environ:
+            env_map[name] = os.environ[name]
+
+    # 3) Compose object
+    labels = make_traefik_labels(sid, internal_port)
     compose_yaml = {
         "version": "3.9",
         "services": {
             "app": {
-                "build": {
-                    "context": str(repo_dir),
-                    "dockerfile": str(df_path),
-                },
-                # optional tag makes rebuilds faster if reused
+                "build": { "context": str(repo_dir), "dockerfile": str(df_path) },
                 "image": f"vibe-{sid}:latest",
                 "restart": "unless-stopped",
                 "networks": ["vibes_net"],
                 "labels": labels,
+                "environment": env_map,
             }
         },
         "networks": {"vibes_net": {"external": True}},
     }
-    svc = compose_yaml["services"]["app"]
-    if env_map:
-        svc["environment"] = env_map
+    env_file = server_cfg.get("env_file")
     if env_file:
-        svc["env_file"] = [env_file]
+        compose_yaml["services"]["app"]["env_file"] = [env_file]
 
     yml_path = ddir / "docker-compose.yml"
     yml_path.write_text(yaml.safe_dump(compose_yaml, sort_keys=False))
