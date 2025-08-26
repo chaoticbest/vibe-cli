@@ -95,7 +95,7 @@ def deploy(repo: str, app_id: Optional[str] = typer.Option(None, help="Override 
     app_type = (cfg.get("type") or "static").lower()
     build_cfg = cfg.get("build", {}) if isinstance(cfg.get("build"), dict) else {}
 
-    # 3) optional build (static/spa)
+        # 3) optional build (static/spa)
     output_dir: Path
     if app_type in ("static", "spa"):
         install_cmd = build_cfg.get("install")
@@ -103,18 +103,41 @@ def deploy(repo: str, app_id: Optional[str] = typer.Option(None, help="Override 
         base_path_env = build_cfg.get("base_path_env")
         if install_cmd:
             run(install_cmd.split(), cwd=repo_dir)
+
         env = os.environ.copy()
+
+        # Base path for assets/routes
         if base_path_env:
             env[base_path_env] = f"/app/{app_id}/"
             print(f"[blue]Set {base_path_env}={env[base_path_env]}[/]")
+
+        # Build-time env from the current shell
+        for name in (build_cfg.get("env") or []):
+            if name in os.environ:
+                env[name] = os.environ[name]
+            else:
+                print(f"[yellow]Warning:[/] build env {name} not set in process environment")
+
+        # Build-time env from a file (KEY=VALUE lines)
+        env_file = build_cfg.get("env_file")
+        if env_file:
+            p = Path(env_file)
+            if p.exists():
+                for line in p.read_text().splitlines():
+                    line = line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    k, v = line.split("=", 1)
+                    env[k.strip()] = v.strip()
+                print(f"[green]Loaded build env from[/] {p}")
+            else:
+                print(f"[yellow]Note:[/] env_file not found at {p}")
+
         if build_cmd:
             run(build_cmd.split(), cwd=repo_dir, env=env)
         out = build_cfg.get("output_dir")
         output_dir = (repo_dir / out).resolve() if out else guess_output_dir(repo_dir)
-    else:
-        # server not supported in v1
-        print("[red]This v1 only supports type=static/spa[/]")
-        raise typer.Exit(code=2)
+
 
     if not output_dir.exists():
         print(f"[red]Build output not found[/]: {output_dir}")
