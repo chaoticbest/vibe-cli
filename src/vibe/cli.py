@@ -262,10 +262,12 @@ def deploy(repo: str, app_id: Optional[str] = typer.Option(None, help="Override 
     if "id" in cfg:
         app_id = slugify(cfg["id"])
 
-    app_type = (cfg.get("type") or "static").lower()
+        app_type = (cfg.get("type") or "static").lower()
     build_cfg = cfg.get("build", {}) if isinstance(cfg.get("build"), dict) else {}
     use_docker = bool(build_cfg.get("use_docker"))
     docker_image = build_cfg.get("image", "node:20-alpine")
+
+    output_dir = None  # will be set for static/spa only
 
     if app_type in ("static","spa"):
         install_cmd = build_cfg.get("install")
@@ -279,13 +281,16 @@ def deploy(repo: str, app_id: Optional[str] = typer.Option(None, help="Override 
 
         # env vars from shell + env_file
         for name in (build_cfg.get("env") or []):
-            if name in os.environ: env[name] = os.environ[name]
+            if name in os.environ:
+                env[name] = os.environ[name]
         env_file = build_cfg.get("env_file")
         if env_file and Path(env_file).exists():
             for line in Path(env_file).read_text().splitlines():
-                line=line.strip()
-                if not line or line.startswith("#") or "=" not in line: continue
-                k,v = line.split("=",1); env[k.strip()] = v.strip()
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                env[k.strip()] = v.strip()
             print(f"[green]Loaded build env from[/] {env_file}")
 
         if use_docker:
@@ -300,28 +305,28 @@ def deploy(repo: str, app_id: Optional[str] = typer.Option(None, help="Override 
 
         out = build_cfg.get("output_dir")
         output_dir = (repo_dir / out).resolve() if out else guess_output_dir(repo_dir)
+
+        # copy static artifacts
+        if not output_dir or not output_dir.exists():
+            print(f"[red]Build output not found[/]: {output_dir}")
+            raise typer.Exit(code=2)
+
+        dest = STATIC_ROOT / app_id
+        print(f"[green]Copying static files[/] {output_dir} → {dest}")
+        copy_static(output_dir, dest)
+
     elif app_type == "server":
         server_cfg = cfg.get("server") or {}
-        # Compose file for this app
         yml = write_compose(app_id, repo_dir, server_cfg)
         print(f"[green]Compose written[/] → {yml}")
-        # Bring it up (build image + start)
         run(["docker", "compose", "-f", str(yml), "up", "-d", "--build"])
-        output_dir = None  # not used
+        # no static copy for server apps
+
     else:
         print("[red]Unknown app type[/]:", app_type)
         raise typer.Exit(code=2)
 
-    if not output_dir:
-        print(f"[red]Build output not found[/]: {output_dir}")
-        raise typer.Exit(code=2)
-
-    # 4) copy into /srv/vibes/static/<id>/
-    dest = STATIC_ROOT / app_id
-    print(f"[green]Copying static files[/] {output_dir} → {dest}")
-    copy_static(output_dir, dest)
-
-    # 5) update registry
+    # registry update (same for both kinds)
     reg = load_registry()
     now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     entry = reg["apps"].get(app_id, {})
@@ -344,6 +349,7 @@ def deploy(repo: str, app_id: Optional[str] = typer.Option(None, help="Override 
     save_registry(reg)
 
     print(f"\n[bold green]Deployed![/] → {entry['links']['app']}")
+
 
 @app.command()
 def undeploy(
