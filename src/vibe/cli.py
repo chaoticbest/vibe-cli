@@ -12,6 +12,29 @@ STATIC_ROOT = VIBES_ROOT / "static"
 APPS_ROOT = VIBES_ROOT / "apps"
 REGISTRY_PATH = VIBES_ROOT / "registry" / "apps.json"
 
+def safe_rmtree(path: Path) -> bool:
+    try:
+        if path.exists():
+            if path.is_file() or path.is_symlink():
+                path.unlink()
+            else:
+                shutil.rmtree(path)
+            return True
+        return False
+    except Exception as e:
+        print(f"[red]Failed to remove[/] {path}: {e}")
+        return False
+
+def compose_down_if_present(app_id: str) -> bool:
+    """Stop a dynamic app if a compose file exists (future-proof)."""
+    deploy_dir = APPS_ROOT / app_id / ".deploy"
+    yml = deploy_dir / "docker-compose.yml"
+    if yml.exists():
+        print(f"[cyan]Bringing down compose stack[/] in {deploy_dir}")
+        run(["docker", "compose", "-f", str(yml), "down", "--remove-orphans", "-v"])
+        return True
+    return False
+
 def docker_run(image: str, workdir: Path, commands: str, env: dict):
     cmd = ["docker","run","--rm","-v",f"{workdir}:/src","-w","/src"]
     for k,v in env.items():
@@ -173,6 +196,82 @@ def deploy(repo: str, app_id: Optional[str] = typer.Option(None, help="Override 
     save_registry(reg)
 
     print(f"\n[bold green]Deployed![/] → {entry['links']['app']}")
+
+@app.command()
+def undeploy(
+    app_id: str = typer.Argument(..., help="App id to undeploy (slug)"),
+    purge: bool = typer.Option(False, help="Also delete cloned repo/work dir"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation prompt"),
+):
+    """
+    Remove an app from the Hub:
+      - delete /srv/vibes/static/<id>/
+      - docker compose down (if present)
+      - remove registry entry
+      - optionally delete /srv/vibes/apps/<id>/ with --purge
+    """
+    sid = slugify(app_id)
+    reg = load_registry()
+    exists_in_registry = sid in reg.get("apps", {})
+
+    # Show what will happen
+    static_dir = STATIC_ROOT / sid
+    work_dir = APPS_ROOT / sid
+    blog_md = VIBES_ROOT / "blog" / f"{sid}.md"
+    actions = [
+        f"Stop dynamic stack (if any) at {work_dir}/.deploy/",
+        f"Remove static files at {static_dir}",
+        f"Remove registry entry for '{sid}'" + ("" if exists_in_registry else " (not found; will skip)"),
+    ]
+    if purge:
+        actions.append(f"Delete work dir at {work_dir}")
+    # (optional) remove blog stub if you use per-app markdown names
+    if blog_md.exists():
+        actions.append(f"Remove blog markdown at {blog_md}")
+
+    print("[bold]Planned actions:[/]")
+    for a in actions:
+        print(f"  • {a}")
+
+    if not yes:
+        if not typer.confirm(f"Proceed to undeploy '{sid}'?", default=False):
+            print("[yellow]Aborted.[/]")
+            raise typer.Exit(code=1)
+
+    # 1) bring down any compose stack
+    try:
+        compose_down_if_present(sid)
+    except subprocess.CalledProcessError as e:
+        print(f"[red]compose down failed[/]: {e}")
+
+    # 2) remove static files
+    if safe_rmtree(static_dir):
+        print(f"[green]Removed[/] {static_dir}")
+    else:
+        print(f"[yellow]Static dir not found[/]: {static_dir}")
+
+    # 3) remove blog stub if present (optional)
+    if blog_md.exists():
+        if safe_rmtree(blog_md):
+            print(f"[green]Removed[/] {blog_md}")
+
+    # 4) remove from registry
+    if exists_in_registry:
+        del reg["apps"][sid]
+        save_registry(reg)
+        print(f"[green]Registry entry removed[/]: {sid}")
+    else:
+        print(f"[yellow]No registry entry for[/] {sid}")
+
+    # 5) optionally remove cloned repo/work dir
+    if purge:
+        if safe_rmtree(work_dir):
+            print(f"[green]Removed work dir[/]: {work_dir}")
+        else:
+            print(f"[yellow]Work dir not found[/]: {work_dir}")
+
+    print(f"\n[bold green]Undeployed '{sid}'.[/]")
+
 
 @app.command()
 def list():
