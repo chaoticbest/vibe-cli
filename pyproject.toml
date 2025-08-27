@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "vibe-cli"
 version = "0.1.1"
-description = "CLI to deploy vibe-coded apps to vibes.chaoticbest.com"
+description = "CLI to deploy vibe-coded apps using vibe-proxy and vibe-hub"
 authors = [{name="ChaoticBest"}]
 readme = "README.md"
 requires-python = ">=3.9"
