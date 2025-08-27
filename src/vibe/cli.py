@@ -235,16 +235,16 @@ def parse_vibe_yaml(repo_dir: Path) -> dict:
 @app.command()
 def deploy(repo: str, app_id: Optional[str] = typer.Option(None, help="Override app id")):
     """
-    Deploy a static (or prebuilt) app to /app/<id>/ by copying build output into /srv/vibes/static/<id>/
+    Deploy an app:
+      - static/spa: (optional) build + copy to /srv/vibes/static/<id>/
+      - server: generate compose + up (no static copy)
     """
     VIBES_ROOT.mkdir(parents=True, exist_ok=True)
     STATIC_ROOT.mkdir(parents=True, exist_ok=True)
     APPS_ROOT.mkdir(parents=True, exist_ok=True)
 
     # 1) clone or pull
-    repo_url = repo
-    if repo_url.endswith("/"):
-        repo_url = repo_url[:-1]
+    repo_url = repo[:-1] if repo.endswith("/") else repo
     inferred = slugify(Path(repo_url).stem)
     app_id = slugify(app_id or inferred)
     work_dir = APPS_ROOT / app_id
@@ -257,29 +257,31 @@ def deploy(repo: str, app_id: Optional[str] = typer.Option(None, help="Override 
         work_dir.mkdir(parents=True, exist_ok=True)
         run(["git", "clone", repo_url, str(repo_dir)])
 
-    # 2) config
-    cfg = parse_vibe_yaml(repo_dir)
+    # 2) load config with safe defaults (no vibe.yaml => static)
+    cfg = parse_vibe_yaml(repo_dir) or {}
     if "id" in cfg:
-        app_id = slugify(cfg["id"])
+        app_id = slugify(cfg["id"]) or app_id  # allow override but keep fallback
 
-        app_type = (cfg.get("type") or "static").lower()
-    build_cfg = cfg.get("build", {}) if isinstance(cfg.get("build"), dict) else {}
-    use_docker = bool(build_cfg.get("use_docker"))
-    docker_image = build_cfg.get("image", "node:20-alpine")
+    app_type = (cfg.get("type") or "static").lower()
+    if app_type in ("static", "spa"):
+        build_cfg = cfg.get("build") if isinstance(cfg.get("build"), dict) else {}
+    else:
+        build_cfg = {}  # irrelevant for server
 
-    output_dir = None  # will be set for static/spa only
-
-    if app_type in ("static","spa"):
+    # --- STATIC/SPA PATH ---
+    if app_type in ("static", "spa"):
         install_cmd = build_cfg.get("install")
         build_cmd   = build_cfg.get("command")
         base_path_env = build_cfg.get("base_path_env")
 
         env = os.environ.copy()
+
+        # base path injection if requested
         if base_path_env:
             env[base_path_env] = f"/app/{app_id}/"
             print(f"[blue]Set {base_path_env}={env[base_path_env]}[/]")
 
-        # env vars from shell + env_file
+        # extra build envs (shell + env_file)
         for name in (build_cfg.get("env") or []):
             if name in os.environ:
                 env[name] = os.environ[name]
@@ -293,21 +295,25 @@ def deploy(repo: str, app_id: Optional[str] = typer.Option(None, help="Override 
                 env[k.strip()] = v.strip()
             print(f"[green]Loaded build env from[/] {env_file}")
 
+        # optional build; if no commands, we just copy guessed output dir
+        use_docker = bool(build_cfg.get("use_docker"))
+        docker_image = build_cfg.get("image", "node:20-alpine")
+
         if use_docker:
             cmds = []
             if install_cmd: cmds.append(install_cmd)
             if build_cmd:   cmds.append(build_cmd)
-            if not cmds:    cmds.append("npm ci && npm run build")
-            docker_run(docker_image, repo_dir, " && ".join(cmds), env)
+            if cmds:
+                docker_run(docker_image, repo_dir, " && ".join(cmds), env)
         else:
             if install_cmd: run(install_cmd.split(), cwd=repo_dir)
             if build_cmd:   run(build_cmd.split(),   cwd=repo_dir, env=env)
 
+        # choose output dir (dist/build/public, else the repo itself)
         out = build_cfg.get("output_dir")
         output_dir = (repo_dir / out).resolve() if out else guess_output_dir(repo_dir)
 
-        # copy static artifacts
-        if not output_dir or not output_dir.exists():
+        if not output_dir.exists():
             print(f"[red]Build output not found[/]: {output_dir}")
             raise typer.Exit(code=2)
 
@@ -315,18 +321,19 @@ def deploy(repo: str, app_id: Optional[str] = typer.Option(None, help="Override 
         print(f"[green]Copying static files[/] {output_dir} → {dest}")
         copy_static(output_dir, dest)
 
+    # --- SERVER PATH ---
     elif app_type == "server":
         server_cfg = cfg.get("server") or {}
         yml = write_compose(app_id, repo_dir, server_cfg)
         print(f"[green]Compose written[/] → {yml}")
         run(["docker", "compose", "-f", str(yml), "up", "-d", "--build"])
-        # no static copy for server apps
+        # no static copy here
 
     else:
         print("[red]Unknown app type[/]:", app_type)
         raise typer.Exit(code=2)
 
-    # registry update (same for both kinds)
+    # 3) update registry (common)
     reg = load_registry()
     now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     entry = reg["apps"].get(app_id, {})
@@ -349,6 +356,7 @@ def deploy(repo: str, app_id: Optional[str] = typer.Option(None, help="Override 
     save_registry(reg)
 
     print(f"\n[bold green]Deployed![/] → {entry['links']['app']}")
+
 
 
 @app.command()
