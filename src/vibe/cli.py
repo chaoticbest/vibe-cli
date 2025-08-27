@@ -1,4 +1,5 @@
-import json, os, re, shutil, subprocess, sys, time
+import json, os, re, shutil, subprocess, time
+from urllib.parse import urlparse
 from pathlib import Path
 from typing import Optional
 import typer, yaml
@@ -12,6 +13,50 @@ VIBES_ROOT = Path(os.environ.get("VIBES_ROOT", "/srv/vibes")).resolve()
 STATIC_ROOT = VIBES_ROOT / "static"
 APPS_ROOT = VIBES_ROOT / "apps"
 REGISTRY_PATH = VIBES_ROOT / "registry" / "apps.json"
+
+def _parse_dotenv(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    env = {}
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        env[k.strip()] = v.strip()
+    return env
+
+def detect_base_url() -> str:
+    """
+    Detect the base URL to show in links / registry.
+    Order:
+      1) VIBES_BASE_URL env (e.g., https://apps.example.com)
+      2) /srv/vibes/proxy/.env => DOMAIN=https://<domain>
+      3) http://<first-nonlocal-ip>
+      4) http://localhost
+    """
+    v = os.environ.get("VIBES_BASE_URL")
+    if v:
+        return v.rstrip("/")
+
+    proxy_env = _parse_dotenv(Path("/srv/vibes/proxy/.env"))
+    dom = (proxy_env.get("DOMAIN") or "").strip()
+    if dom:
+        return f"https://{dom}".rstrip("/")
+
+    # Best-effort local IP (no internet dependency)
+    try:
+        out = subprocess.check_output(["hostname", "-I"], text=True).strip()
+        ip = (out.split() or [""])[0]
+        if ip:
+            return f"http://{ip}".rstrip("/")
+    except Exception:
+        pass
+
+    return "http://localhost"
+
+def ensure_trailing(s: str) -> str:
+    return s if s.endswith("/") else s + "/"
 
 def infer_port_from_dockerfile(path: Path) -> int | None:
     try:
@@ -37,24 +82,51 @@ def default_port_for_runtime(runtime: str) -> int:
         return 8000
     return 3000  # node or other
 
-def make_traefik_labels(app_id: str, internal_port: int | None) -> list[str]:
-    rid = slugify(app_id).replace("-", "_")
-    host = "vibes.chaoticbest.com"
+def make_traefik_labels(app_id: str, internal_port: int | None, base_url: str | None = None) -> list[str]:
+    """
+    Create two routers:
+      - HTTP (no Host) so it works by IP immediately
+      - HTTPS (Host=DOMAIN) only if a domain was configured in base_url
+    """
+    sid = slugify(app_id)
+    rid = sid.replace("-", "_")
+    host = None
+    if base_url:
+        try:
+            host = urlparse(base_url).hostname
+        except Exception:
+            host = None
+
     labels = [
         "traefik.enable=true",
-        f"traefik.http.routers.{rid}.rule=Host(`{host}`) && PathPrefix(`/app/{app_id}`)",
-        f"traefik.http.routers.{rid}.entrypoints=web,websecure",
-        f"traefik.http.routers.{rid}.tls=true",
-        f"traefik.http.routers.{rid}.tls.certresolver=le",
-        f"traefik.http.routers.{rid}.priority=100",
-        f"traefik.http.middlewares.{rid}-strip.stripprefix.prefixes=/app/{app_id}",
-        f"traefik.http.routers.{rid}.middlewares={rid}-strip",
+        # common middleware: strip /app/<id>
+        f"traefik.http.middlewares.{rid}-strip.stripprefix.prefixes=/app/{sid}",
     ]
+
+    # HTTP router (catch-all by any Host, works via IP)
+    labels += [
+        f"traefik.http.routers.{rid}-http.rule=PathPrefix(`/app/{sid}`)",
+        f"traefik.http.routers.{rid}-http.entrypoints=web",
+        f"traefik.http.routers.{rid}-http.priority=100",
+        f"traefik.http.routers.{rid}-http.middlewares={rid}-strip",
+    ]
+
+    # HTTPS router (only if we have a domain)
+    if host:
+        labels += [
+            f"traefik.http.routers.{rid}-https.rule=Host(`{host}`) && PathPrefix(`/app/{sid}`)",
+            f"traefik.http.routers.{rid}-https.entrypoints=websecure",
+            f"traefik.http.routers.{rid}-https.tls=true",
+            f"traefik.http.routers.{rid}-https.tls.certresolver=le",
+            f"traefik.http.routers.{rid}-https.priority=100",
+            f"traefik.http.routers.{rid}-https.middlewares={rid}-strip",
+        ]
+
+    # Service port (if known). If omitted, Traefik falls back to EXPOSE.
     if internal_port:
         labels.append(f"traefik.http.services.{rid}.loadbalancer.server.port={internal_port}")
-    # If internal_port is None, Traefik will try the container's EXPOSEd port.
-    return labels
 
+    return labels
 
 def generate_dockerfile(repo_dir: Path, app_id: str, server_cfg: dict) -> tuple[Path, int]:
     runtime = (server_cfg.get("runtime") or "").lower()
@@ -338,14 +410,15 @@ def deploy(repo: str, app_id: Optional[str] = typer.Option(None, help="Override 
     now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     entry = reg["apps"].get(app_id, {})
     created = entry.get("created_at", now)
+    base = detect_base_url()
     entry.update({
         "id": app_id,
         "name": cfg.get("name") or app_id,
         "type": app_type,
         "repo": repo_url,
         "links": {
-            "app": f"https://vibes.chaoticbest.com/app/{app_id}/",
-            "blog": f"https://vibes.chaoticbest.com/blog/{app_id}",
+            "app": ensure_trailing(f"{base}/app/{app_id}"),
+            "blog": f"{base}/blog/{app_id}",
             "github": repo_url if repo_url.startswith("http") else f"https://github.com/{repo_url}"
         },
         "created_at": created,
@@ -356,8 +429,6 @@ def deploy(repo: str, app_id: Optional[str] = typer.Option(None, help="Override 
     save_registry(reg)
 
     print(f"\n[bold green]Deployed![/] → {entry['links']['app']}")
-
-
 
 @app.command()
 def undeploy(
